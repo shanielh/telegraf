@@ -108,16 +108,48 @@ func listen(msgs <-chan amqp.Delivery, acc telegraf.Accumulator) {
 // and then adds them to the Accumulator
 func handleMessage(d amqp.Delivery, acc telegraf.Accumulator) {
 	msg := sanitizeMsg(d)
-	acc.AddFields(msg.Name(), msg.Fields(), msg.Tags(), msg.Time())
-	d.Ack(false)
+	switch msg.Name() {
+	case "proc":
+		if _, ok := msg.Fields()["num"].(float64); !ok {
+			d.Ack(false)
+			log.Printf("string field instead of float field %v\n", msg)
+			return
+		}
+		d.Ack(false)
+		acc.AddFields(msg.Name(), msg.Fields(), msg.Tags(), msg.Time())
+	default:
+		d.Ack(false)
+		acc.AddFields(msg.Name(), msg.Fields(), msg.Tags(), msg.Time())
+	}
 }
 
 // sanitizeMsg breaks message cleanly into the different parts
 // turns them into an IR and returns a point
 func sanitizeMsg(msg amqp.Delivery) *client.Point {
 	ir := &irMessage{}
-	if strings.Contains(string(msg.Body), `"host"`) {
-		text := strings.Split(string(msg.Body), "\"host\"")
+	m := string(msg.Body)
+	switch {
+	case strings.Contains(m, "'severity'"):
+		text := strings.Split(m, "'severity'")
+		clockSplit := strings.Split(text[1], "'clock'")
+		ir.severity = clockSplit[0]
+		tsSplit := strings.Split(clockSplit[1], "'timestamp'")
+		ir.clock = tsSplit[0]
+		valueSplit := strings.Split(tsSplit[1], "'value'")
+		ir.ts = valueSplit[0]
+		serverSplit := strings.Split(valueSplit[1], "'server'")
+		ir.value = serverSplit[0]
+		sourceSplit := strings.Split(serverSplit[1], "'source'")
+		ir.server = sourceSplit[0]
+		hostSplit := strings.Split(sourceSplit[1], "'host'")
+		ir.source = hostSplit[0]
+		keySplit := strings.Split(hostSplit[1], "'key'")
+		ir.host = keySplit[0]
+		logEventSplit := strings.Split(keySplit[1], "'logeventid'")
+		ir.key = logEventSplit[0]
+		ir.logeventid = logEventSplit[1]
+	case strings.Contains(m, `"host"`):
+		text := strings.Split(m, "\"host\"")
 		hostSplit := strings.Split(text[1], "\"clock\"")
 		ir.host = hostSplit[0]
 		clockSplit := strings.Split(hostSplit[1], "\"value\"")
@@ -128,8 +160,8 @@ func sanitizeMsg(msg amqp.Delivery) *client.Point {
 		ir.key = keySplit[0]
 		ir.server = keySplit[1]
 		ir.doubleQuoted = true
-	} else {
-		text := strings.Split(string(msg.Body), "'host'")
+	case strings.Contains(m, "'host'"):
+		text := strings.Split(m, "'host'")
 		hostSplit := strings.Split(text[1], "'clock'")
 		ir.host = hostSplit[0]
 		clockSplit := strings.Split(hostSplit[1], "'value'")
@@ -147,7 +179,6 @@ func sanitizeMsg(msg amqp.Delivery) *client.Point {
 // Takes the intermediate representation and turns it into a message
 func (ir *irMessage) message() message {
 	var msg message
-
 	// trim trailing chars from value
 	ir.value = string(ir.value[2 : len(ir.value)-2])
 
@@ -173,6 +204,10 @@ type irMessage struct {
 	value        string
 	key          string
 	server       string
+	severity     string
+	ts           string
+	source       string
+	logeventid   string
 	doubleQuoted bool
 }
 
@@ -230,7 +265,12 @@ func (ir *irMessage) toFloatMessage() *floatMessage {
 		fm.server = cleanHost(ir.server)
 		i, err := strconv.ParseFloat(ir.value, 64)
 		if err != nil {
-			panic(fmt.Errorf("%v: parsing float", err))
+			j, err := strconv.ParseInt(ir.value, 10, 64)
+			if err != nil {
+				// if we fail to parse a value out of the string we return 0
+				log.Printf("Error parsing %v with key %v setting value to 0\n", ir.value, ir.key)
+			}
+			i = float64(j)
 		}
 		fm.value = i
 		fm.key = ir.key
@@ -238,8 +278,13 @@ func (ir *irMessage) toFloatMessage() *floatMessage {
 	return fm
 }
 
-// This is an awful decision tree parsing, but it works...
-// Need to hone with more data
+// This is awful decision tree parsing, but it works...
+// Layout:
+//   I've split all of the keys on the "[" and then [0] of that split on "."
+//   Then I walk down all the different combinations there
+//   The first switch statement is on length of the bracket split
+//   within each case of the bracket switch statement there is a switch
+//   on the length of the period split.
 func structureKey(key string, value interface{}) (string, map[string]string, map[string]interface{}) {
 	// Beginning of Influx point
 	meas := ""
@@ -256,37 +301,63 @@ func structureKey(key string, value interface{}) (string, map[string]string, map
 
 	// No brackets so len(split) == 1
 	case 1:
-
+		meas = ps[0]
 		// Switch on the results of the period split
 		switch len(ps) {
-
 		// meas.field
 		case 2:
-			meas = ps[0]
 			fields[ps[1]] = value
 
 		// meas.field*
 		case 3:
-			meas = ps[0]
 			fields[fmt.Sprintf("%v.%v", ps[1], ps[2])] = value
 
 		// meas.field.field.context
 		case 4:
 			if strings.Contains(ps[3], "-") {
-				meas = ps[0]
 				fields[fmt.Sprintf("%v.%v", ps[1], ps[2])] = value
 				tags["context"] = ps[3]
 			} else {
-				meas = ps[0]
 				fields[fmt.Sprintf("%v.%v.%v", ps[1], ps[2], ps[3])] = value
 			}
-
-		// Default
+		// netscaler.lbv.(rps|srv).(rack)
+		case 6:
+			meas = jwp(ps[0], ps[1])
+			tags["rack"] = jw2p(ps[3], ps[4], ps[5])
+			fields[ps[2]] = value
+		// Default - Deal with "CPU-", "Memory-", "Incoming-", "Outgoing-"
 		default:
-			meas = key
-			fields["value"] = value
+			switch {
+			// "CPU-"
+			case strings.Contains(key, "CPU-"):
+				s := strings.Split(key, "CPU-")
+				meas = "CPU"
+				tags["host"] = s[1]
+				fields["value"] = value
+			// "Memory-"
+			case strings.Contains(key, "Memory-"):
+				s := strings.Split(key, "Memory-")
+				meas = "Memory"
+				tags["host"] = s[1]
+				// "Incoming-"
+				fields["value"] = value
+			case strings.Contains(key, "Incoming-"):
+				s := strings.Split(key, "Incoming-")
+				meas = "Incoming"
+				tags["host"] = s[1]
+				fields["value"] = value
+			// "Outgoing-"
+			case strings.Contains(key, "Outgoing-"):
+				s := strings.Split(key, "Outgoing-")
+				meas = "Outgoing"
+				tags["host"] = s[1]
+				fields["value"] = value
+			// Default!
+			default:
+				meas = key
+				fields["value"] = value
+			}
 		}
-
 	// Brackets so len(split) == 2
 	// longest case
 	case 2:
@@ -299,21 +370,37 @@ func structureKey(key string, value interface{}) (string, map[string]string, map
 			meas = ps[0]
 			bracket := trim(bs[1])
 			// Arcane parsing rules
+			slash := strings.Contains(bs[1], "/")
+			comma := strings.Contains(bs[1], ",")
+			dash := strings.Contains(bs[1], "-")
+			vlan := strings.Contains(bs[1], "Vlan")
+			inter := strings.Contains(meas, "if")
 			switch {
 
 			// Bracket contains something like 1/40 -> ignore
-			case strings.Contains(bs[1], "/"):
+			case slash:
 				fields["value"] = value
-
-			// bracket is field name wiht some changes
-			case strings.Contains(bs[1], ","):
+			// bracket is field name with some changes
+			case comma:
 				// switch "," and " " to "."
 				bracket = rp(rp(bracket, ",", "."), " ", ".")
 				fields[bracket] = value
-
+			// bracket contains a port number
+			case dash:
+				ds := strings.Split(bracket, "-")
+				tags[ds[0]] = ds[1]
+				fields["value"] = value
+			// Bracket contains a Vlan number
+			case vlan:
+				s := strings.Split(bracket, "Vlan")
+				tags["Vlan"] = s[1]
+				fields["value"] = value
+			// Bracket contains an interface name
+			case inter:
+				tags["interface"] = bracket
+				fields["value"] = value
 			// Default
 			default:
-				// log.Printf("HITTING DEFAULT: %v\n", key)
 				meas = key
 				fields["value"] = value
 			}
@@ -346,15 +433,16 @@ func structureKey(key string, value interface{}) (string, map[string]string, map
 
 			// Default
 			default:
-				meas = key
-				fields["value"] = value
+				meas = ps[0]
+				f := strings.Split(bracket, "FailureStatus")
+				tags["ps"] = f[0]
+				fields["powersupply.failurestatus"] = value
 			}
 
 		// len(period_split) == 3 and contains more information
 		case 3:
 			meas = ps[0]
 			bracket := trim(bs[1])
-
 			// Switch on bracket content
 			switch {
 
@@ -367,9 +455,13 @@ func structureKey(key string, value interface{}) (string, map[string]string, map
 			case strings.Contains(bracket, "/"):
 				t := strings.Split(bracket, ",")
 				tags["path"] = t[0]
-				fields[jw2p(ps[1], ps[2], t[1])] = value
+				if len(t) > 1 {
+					fields[jw2p(ps[1], ps[2], t[1])] = value
+				} else {
+					fields[jwp(ps[1], ps[2])] = value
+				}
 
-			// TODO: find a non default case that fits all "net","system","vm" meass down here
+			// TODO: find a non default case that fits all "net","system","vm" mess down here
 			default:
 				bracketCommaSplit := strings.Split(bracket, ",")
 
@@ -407,14 +499,16 @@ func structureKey(key string, value interface{}) (string, map[string]string, map
 
 				// web measurement
 				case meas == "web":
-					meas = jwp(ps[0], ps[1])
 					if ps[2] == "time" {
 						fields["value"] = value
 					} else {
-						fields[ps[2]] = value
+						fields[jwp(ps[1], ps[2])] = value
 					}
 					tags["system"] = "ZabbixGUI"
-
+				// app measurement
+				case meas == "app":
+					fields[jwp(ps[1], ps[2])] = value
+					tags["provider"] = bracket
 				// Default
 				default:
 					meas = key
@@ -454,8 +548,12 @@ func structureKey(key string, value interface{}) (string, map[string]string, map
 
 	// Multiple brackets -> grpavg["app-searchautocomplete","system.cpu.util[,user]",last,0]
 	default:
-		meas = key
-		fields["value"] = value
+		sp := strings.Split(strings.Split(key, "grpavg[")[1], ",")
+		tags["app"] = trimS(sp[0])
+		s := strings.Split(trimS(sp[1]), ".")
+		meas = s[0]
+		field := fmt.Sprintf("%v.%v.%v.%v", s[1], s[2], sp[3], sp[4])
+		fields[field] = value
 	}
 	// Return the start of a point
 	return meas, tags, fields
@@ -493,6 +591,10 @@ type floatMessage struct {
 	value  float64
 	key    string
 	server string
+}
+
+func trimS(s string) string {
+	return s[1 : len(s)-1]
 }
 
 // satisfies the message interface
